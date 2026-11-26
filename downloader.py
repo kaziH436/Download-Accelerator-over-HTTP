@@ -1,233 +1,191 @@
-"""Download accelerator over HTTP.
-
-Usage:
-    python downloader.py NumberOfThreads ObjectURI localFilename
-    python downloader.py 4 http://www.textfiles.com/art/cowz.txt out.txt
-
-Flow:
-    1. Send a HEAD request to learn the object's size (Content-Length).
-    2. Pre-allocate a local file of that size.
-    3. Split the object into byte ranges, one per thread.
-    4. Each thread sends a GET with a Range header and writes the
-       response body directly to its own position in the file.
-"""
-
-import math
-import socket
+# Usage: python downloader.py NumberOfThreads ObjectURI localFilename
+# Example: python downloader.py 4 http://www.textfiles.com/art/cowz.txt out.txt
 import sys
-import threading
-from urllib.parse import urlparse
+from socket import *
+from threading import Thread
 
+BUFFER_SIZE = 4096
 MIN_THREADS = 1
 MAX_THREADS = 16
-RECV_SIZE = 4096
-TIMEOUT_SECONDS = 30
 HEADER_END = b"\r\n\r\n"
 
 
-# ---------------------------------------------------------------------------
-# Small HTTP helpers
-# ---------------------------------------------------------------------------
+def parseUri(uri):
+    """Split http://host[:port]/path into (host, port, path)."""
+    if not uri.startswith("http://"):
+        raise ValueError("ObjectURI must start with http://")
 
-def parse_uri(uri):
-    """Split a URI into (host, port, path). Path includes any query string."""
-    parsed = urlparse(uri)
-    if parsed.scheme != "http" or not parsed.hostname:
-        raise ValueError("ObjectURI must look like http://host/path")
+    rest = uri[len("http://"):]
+    hostPart, slash, path = rest.partition("/")
+    path = "/" + path
 
-    port = parsed.port or 80
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
-    return parsed.hostname, port, path
+    host, colon, port = hostPart.partition(":")
+    port = int(port) if colon else 80
 
-
-def build_request(method, host, path, byte_range=None):
-    """Build a raw HTTP/1.0 request. byte_range is an optional (start, end)."""
-    lines = [f"{method} {path} HTTP/1.0", f"Host: {host}"]
-    if byte_range is not None:
-        start, end = byte_range
-        lines.append(f"Range: bytes={start}-{end}")
-    lines.append("Connection: close")
-    return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+    if not host:
+        raise ValueError("ObjectURI has no host name")
+    return host, port, path
 
 
-def parse_response_head(raw_head):
-    """Return (status_code, headers) from the raw bytes before the blank line.
+def connectAndSend(server_addr, request):
+    """Connect to the server, send the request and return the socket."""
+    clientSock = socket(AF_INET, SOCK_STREAM)
+    try:
+        clientSock.connect(server_addr)
+        clientSock.sendall(request.encode())
+    except Exception:
+        clientSock.close()
+        raise
+    return clientSock
 
-    Header names are lowercased so lookups are case-insensitive.
+
+def readHeaders(clientSock):
+    """Read until the blank line that ends the headers.
+
+    Returns (headers as text, any body bytes already received).
     """
-    lines = raw_head.decode("iso-8859-1").split("\r\n")
-    status_code = int(lines[0].split()[1])
-
-    headers = {}
-    for line in lines[1:]:
-        name, _, value = line.partition(":")
-        headers[name.strip().lower()] = value.strip()
-    return status_code, headers
-
-
-def open_connection(host, port, request):
-    """Connect to the server, send the request, and return the socket."""
-    sock = socket.create_connection((host, port), timeout=TIMEOUT_SECONDS)
-    sock.sendall(request)
-    return sock
-
-
-def read_response_head(sock):
-    """Read from sock until the end of the headers.
-
-    Returns (raw_head, leftover), where leftover is any body bytes that
-    arrived in the same recv() as the end of the headers.
-    """
-    buffer = b""
-    while HEADER_END not in buffer:
-        chunk = sock.recv(RECV_SIZE)
+    data = b""
+    while HEADER_END not in data:
+        chunk = clientSock.recv(BUFFER_SIZE)
         if not chunk:
-            raise ConnectionError("Connection closed before headers finished")
-        buffer += chunk
+            raise Exception("connection closed before the headers ended")
+        data += chunk
 
-    raw_head, _, leftover = buffer.partition(HEADER_END)
-    return raw_head, leftover
-
-
-# ---------------------------------------------------------------------------
-# Download logic
-# ---------------------------------------------------------------------------
-
-def get_object_size(host, port, path):
-    """Issue a HEAD request and return the object's Content-Length."""
-    request = build_request("HEAD", host, path)
-    with open_connection(host, port, request) as sock:
-        raw_head, _ = read_response_head(sock)
-
-    status, headers = parse_response_head(raw_head)
-    if status != 200:
-        raise RuntimeError(f"HEAD request failed with status {status}")
-    if "content-length" not in headers:
-        raise RuntimeError("Server did not send a Content-Length header")
-    return int(headers["content-length"])
+    head, _, body = data.partition(HEADER_END)
+    return head.decode(), body
 
 
-def split_into_ranges(size, num_threads):
-    """Divide [0, size) into inclusive (start, end) byte ranges.
-
-    Each range is ceil(size / num_threads) bytes, except the last one,
-    which gets whatever remains. Empty ranges are dropped.
-    """
-    chunk = math.ceil(size / num_threads)
-    ranges = []
-    for i in range(num_threads):
-        start = i * chunk
-        if start >= size:
-            break
-        end = min(start + chunk - 1, size - 1)
-        ranges.append((start, end))
-    return ranges
+def getStatusCode(head):
+    # First line looks like: HTTP/1.1 206 Partial Content
+    return int(head.split("\r\n")[0].split()[1])
 
 
-def download_range(host, port, path, byte_range, local_filename, errors):
-    """Worker: download one byte range and write it into the local file.
+def getContentLength(head):
+    for line in head.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            return int(line.split(":", 1)[1].strip())
+    raise Exception("no Content-Length header in the reply")
 
-    Any failure is appended to `errors` so the main thread can report it.
-    """
-    start, end = byte_range
-    expected_bytes = end - start + 1
 
+def getObjectSize(server_addr, host, path):
+    # Send HEAD request
+    request = (f"HEAD {path} HTTP/1.0\r\n"
+               f"Host: {host}\r\n"
+               f"Connection: close\r\n"
+               f"\r\n")
+    clientSock = connectAndSend(server_addr, request)
     try:
-        request = build_request("GET", host, path, byte_range)
-        with open_connection(host, port, request) as sock:
-            raw_head, body_start = read_response_head(sock)
-            status, _ = parse_response_head(raw_head)
-            if status != 206:
-                raise RuntimeError(f"expected 206 Partial Content, got {status}")
+        head, _ = readHeaders(clientSock)
+    finally:
+        clientSock.close()
 
-            # Each thread uses its own file handle, so seeks don't collide.
-            with open(local_filename, "r+b") as out_file:
-                out_file.seek(start)
-                written = 0
+    if getStatusCode(head) != 200:
+        raise Exception("HEAD request failed:\n" + head)
+    return getContentLength(head)
 
-                data = body_start
+
+def downloadRange(server_addr, host, path, start, end, filename, errors):
+    """Thread function: download bytes start..end and write them to the file."""
+    try:
+        # Send GET request with a Range header
+        request = (f"GET {path} HTTP/1.0\r\n"
+                   f"Host: {host}\r\n"
+                   f"Range: bytes={start}-{end}\r\n"
+                   f"Connection: close\r\n"
+                   f"\r\n")
+        clientSock = connectAndSend(server_addr, request)
+
+        try:
+            head, data = readHeaders(clientSock)
+            if getStatusCode(head) != 206:
+                raise Exception("expected 206 Partial Content, got:\n" + head)
+
+            # Each thread opens its own handle so the seek positions
+            # of different threads do not interfere with each other
+            received = 0
+            with open(filename, "r+b") as f:
+                f.seek(start)
                 while data:
-                    out_file.write(data)
-                    written += len(data)
-                    data = sock.recv(RECV_SIZE)
+                    f.write(data)
+                    received += len(data)
+                    data = clientSock.recv(BUFFER_SIZE)
+        finally:
+            clientSock.close()
 
-        if written != expected_bytes:
-            raise RuntimeError(f"got {written} bytes, expected {expected_bytes}")
+        expected = end - start + 1
+        if received != expected:
+            raise Exception(f"received {received} bytes, expected {expected}")
 
-    except (OSError, RuntimeError, ConnectionError) as error:
-        errors.append(f"bytes {start}-{end}: {error}")
-
-
-def preallocate_file(filename, size):
-    """Create (or overwrite) a file that is exactly `size` bytes long."""
-    with open(filename, "wb") as out_file:
-        out_file.truncate(size)
-
-
-def download(num_threads, uri, local_filename):
-    """Run the full download. Returns True on success."""
-    host, port, path = parse_uri(uri)
-
-    size = get_object_size(host, port, path)
-    print(f"Object size: {size} bytes")
-
-    preallocate_file(local_filename, size)
-    if size == 0:
-        return True
-
-    ranges = split_into_ranges(size, num_threads)
-    errors = []
-    threads = []
-
-    for byte_range in ranges:
-        thread = threading.Thread(
-            target=download_range,
-            args=(host, port, path, byte_range, local_filename, errors),
-        )
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-
-    for message in errors:
-        print(f"Error: {message}", file=sys.stderr)
-    return not errors
-
-
-# ---------------------------------------------------------------------------
-# Command-line entry point
-# ---------------------------------------------------------------------------
-
-def parse_arguments(argv):
-    """Validate command-line arguments and return (num_threads, uri, filename)."""
-    if len(argv) != 4:
-        sys.exit("Usage: python downloader.py NumberOfThreads ObjectURI localFilename")
-
-    try:
-        num_threads = int(argv[1])
-    except ValueError:
-        sys.exit("NumberOfThreads must be an integer")
-
-    if not MIN_THREADS <= num_threads <= MAX_THREADS:
-        sys.exit(f"NumberOfThreads must be between {MIN_THREADS} and {MAX_THREADS}")
-
-    return num_threads, argv[2], argv[3]
+    except Exception as e:
+        errors.append(f"bytes {start}-{end}: {e}")
 
 
 def main():
-    num_threads, uri, local_filename = parse_arguments(sys.argv)
+    # Check the command line arguments
+    if len(sys.argv) != 4:
+        print("Usage: python downloader.py NumberOfThreads ObjectURI localFilename")
+        sys.exit(1)
 
     try:
-        success = download(num_threads, uri, local_filename)
-    except (ValueError, RuntimeError, OSError) as error:
-        sys.exit(f"Error: {error}")
+        numThreads = int(sys.argv[1])
+    except ValueError:
+        print("NumberOfThreads must be an integer")
+        sys.exit(1)
 
-    if not success:
-        sys.exit("Download failed")
-    print(f"Saved to {local_filename}")
+    if numThreads < MIN_THREADS or numThreads > MAX_THREADS:
+        print(f"NumberOfThreads must be between {MIN_THREADS} and {MAX_THREADS}")
+        sys.exit(1)
+
+    uri = sys.argv[2]
+    filename = sys.argv[3]
+
+    try:
+        host, port, path = parseUri(uri)
+    except ValueError as e:
+        print("Bad ObjectURI:", e)
+        sys.exit(1)
+
+    server_addr = (host, port)
+
+    # Issue a HEAD request to learn the size of the object
+    try:
+        size = getObjectSize(server_addr, host, path)
+    except Exception as e:
+        print("HEAD failed:", e)
+        sys.exit(1)
+    print(f"Object size: {size} bytes")
+
+    # Allocate a local file with "size" bytes in it
+    with open(filename, "wb") as f:
+        f.truncate(size)
+
+    # Each thread gets ceil(size / numThreads) bytes; the last one gets the rest
+    chunk = (size + numThreads - 1) // numThreads
+    errors = []
+    threads = []
+
+    for i in range(numThreads):
+        start = i * chunk
+        if start >= size:
+            break  # more threads than bytes: nothing left to assign
+        end = min(start + chunk - 1, size - 1)
+
+        t = Thread(target=downloadRange,
+                   args=(server_addr, host, path, start, end, filename, errors))
+        t.start()
+        threads.append(t)
+
+    # Wait for all worker threads to finish
+    for t in threads:
+        t.join()
+
+    if errors:
+        for message in errors:
+            print("Error:", message)
+        print("Download failed.")
+        sys.exit(1)
+
+    print(f"Download complete: {filename}")
 
 
 if __name__ == "__main__":
