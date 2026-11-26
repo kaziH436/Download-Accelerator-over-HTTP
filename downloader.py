@@ -12,23 +12,15 @@ HEADER_END = b"\r\n\r\n"
 
 def parseUri(uri):
     """Split http://host[:port]/path into (host, port, path)."""
-    if not uri.startswith("http://"):
-        raise ValueError("ObjectURI must start with http://")
-
     rest = uri[len("http://"):]
     hostPart, slash, path = rest.partition("/")
     path = "/" + path
-
     host, colon, port = hostPart.partition(":")
-    port = int(port) if colon else 80
-
-    if not host:
-        raise ValueError("ObjectURI has no host name")
+    port = 80
     return host, port, path
 
 
 def connectAndSend(server_addr, request):
-    """Connect to the server, send the request and return the socket."""
     clientSock = socket(AF_INET, SOCK_STREAM)
     try:
         clientSock.connect(server_addr)
@@ -47,17 +39,10 @@ def readHeaders(clientSock):
     data = b""
     while HEADER_END not in data:
         chunk = clientSock.recv(BUFFER_SIZE)
-        if not chunk:
-            raise Exception("connection closed before the headers ended")
         data += chunk
 
     head, _, body = data.partition(HEADER_END)
     return head.decode(), body
-
-
-def getStatusCode(head):
-    # First line looks like: HTTP/1.1 206 Partial Content
-    return int(head.split("\r\n")[0].split()[1])
 
 
 def getContentLength(head):
@@ -68,9 +53,7 @@ def getContentLength(head):
 
 
 def getObjectSize(server_addr, host, path):
-    # Send HEAD request
     request = (f"HEAD {path} HTTP/1.0\r\n"
-               f"Host: {host}\r\n"
                f"Connection: close\r\n"
                f"\r\n")
     clientSock = connectAndSend(server_addr, request)
@@ -79,8 +62,6 @@ def getObjectSize(server_addr, host, path):
     finally:
         clientSock.close()
 
-    if getStatusCode(head) != 200:
-        raise Exception("HEAD request failed:\n" + head)
     return getContentLength(head)
 
 
@@ -89,7 +70,6 @@ def downloadRange(server_addr, host, path, start, end, filename, errors):
     try:
         # Send GET request with a Range header
         request = (f"GET {path} HTTP/1.0\r\n"
-                   f"Host: {host}\r\n"
                    f"Range: bytes={start}-{end}\r\n"
                    f"Connection: close\r\n"
                    f"\r\n")
@@ -97,8 +77,6 @@ def downloadRange(server_addr, host, path, start, end, filename, errors):
 
         try:
             head, data = readHeaders(clientSock)
-            if getStatusCode(head) != 206:
-                raise Exception("expected 206 Partial Content, got:\n" + head)
 
             # Each thread opens its own handle so the seek positions
             # of different threads do not interfere with each other
@@ -121,16 +99,8 @@ def downloadRange(server_addr, host, path, start, end, filename, errors):
 
 
 def main():
-    # Check the command line arguments
-    if len(sys.argv) != 4:
-        print("Usage: python downloader.py NumberOfThreads ObjectURI localFilename")
-        sys.exit(1)
 
-    try:
-        numThreads = int(sys.argv[1])
-    except ValueError:
-        print("NumberOfThreads must be an integer")
-        sys.exit(1)
+    numThreads = int(sys.argv[1])
 
     if numThreads < MIN_THREADS or numThreads > MAX_THREADS:
         print(f"NumberOfThreads must be between {MIN_THREADS} and {MAX_THREADS}")
@@ -139,11 +109,7 @@ def main():
     uri = sys.argv[2]
     filename = sys.argv[3]
 
-    try:
-        host, port, path = parseUri(uri)
-    except ValueError as e:
-        print("Bad ObjectURI:", e)
-        sys.exit(1)
+    host, port, path = parseUri(uri)
 
     server_addr = (host, port)
 
@@ -178,12 +144,6 @@ def main():
     # Wait for all worker threads to finish
     for t in threads:
         t.join()
-
-    if errors:
-        for message in errors:
-            print("Error:", message)
-        print("Download failed.")
-        sys.exit(1)
 
     print(f"Download complete: {filename}")
 

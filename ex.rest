@@ -1,0 +1,12 @@
+### 211543 bytes
+HEAD http://www.textfiles.com/art/cowz.txt 
+
+### Thread 1
+GET http://www.textfiles.com/art/cowz.txt 
+Range: bytes=0-52885
+Connection: close
+
+### Thread 2
+GET http://www.textfiles.com/art/cowz.txt 
+Range: bytes=52885-105771
+Connection: close
